@@ -1,31 +1,37 @@
 /**
- * Admin JavaScript für das CSV Import Pro Plugin
- * Version: 6.0 - Komplett neu geschrieben und korrigiert
- * 
- * Funktionen:
- * - Robuste CSV-Validierung mit Fehlerbehandlung
- * - Real-time Import-Progress-Updates
- * - Sichere AJAX-Kommunikation
- * - Responsive Admin-Interface
- * - Automatische Error-Recovery
+ * CSV Import Pro Admin JavaScript - Korrigierte Version
  */
+
+// GLOBALE FUNKTIONEN SOFORT DEFINIEREN (vor document ready!)
+window.csvImportTestConfig = function() {
+    console.log('csvImportTestConfig aufgerufen');
+    if (typeof window.CSVImportAdmin !== 'undefined' && window.CSVImportAdmin.testConfiguration) {
+        window.CSVImportAdmin.testConfiguration();
+    } else {
+        alert('Plugin noch nicht initialisiert. Bitte Seite neu laden.');
+    }
+};
+
+window.csvImportValidateCSV = function(type) {
+    console.log('csvImportValidateCSV aufgerufen mit type:', type);
+    if (typeof window.CSVImportAdmin !== 'undefined' && window.CSVImportAdmin.validateCSV) {
+        window.CSVImportAdmin.validateCSV(type);
+    } else {
+        alert('Plugin noch nicht initialisiert. Bitte Seite neu laden.');
+    }
+};
 
 (function($) {
     'use strict';
 
-    // =======================================================================
-    // GLOBALE VARIABLEN & KONFIGURATION
-    // =======================================================================
-
     const CSVImportAdmin = {
         // Debug-System
         debug: {
-            enabled: (typeof csvImportAjax !== 'undefined' && csvImportAjax.debug) || false,
+            enabled: true, // Immer aktiviert für Debugging
             log: function(message, data) {
-                if (this.enabled) {
-                    console.log('🔧 CSV Import:', message, data || '');
-                }
+                console.log('🔧 CSV Import:', message, data || '');
             },
+            // ... rest bleibt gleich
             warn: function(message, data) {
                 console.warn('⚠️ CSV Import:', message, data || '');
             },
