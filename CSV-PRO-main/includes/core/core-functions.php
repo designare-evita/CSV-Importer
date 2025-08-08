@@ -1,9 +1,9 @@
 <?php
 /**
  * Core-Funktionen für das CSV Import Pro Plugin
- * * Diese Datei enthält alle grundlegenden Funktionen, die von anderen Plugin-Teilen
+ * Diese Datei enthält alle grundlegenden Funktionen, die von anderen Plugin-Teilen
  * benötigt werden. Sie muss als erstes geladen werden.
- * * Version: 5.2-refactored
+ * Version: 5.2-refactored (Dashboard Widget bereinigt)
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -306,7 +306,7 @@ function csv_import_get_default_value( string $key ) {
 
 /**
  * Validiert die Plugin-Konfiguration
- * * @param array $config Konfigurationsdaten
+ * @param array $config Konfigurationsdaten
  * @return array Validierungsergebnis
  */
 function csv_import_validate_config( $config ): array {
@@ -405,7 +405,7 @@ function csv_import_validate_config( $config ): array {
 
 /**
  * Validiert eine CSV-Quelle (Dropbox oder lokal)
- * * @param string $type 'dropbox' oder 'local'
+ * @param string $type 'dropbox' oder 'local'
  * @param array $config Plugin-Konfiguration
  * @return array Validierungsergebnis
  */
@@ -615,7 +615,7 @@ function csv_import_analyze_csv_content( string $csv_content, string $source_nam
 
 /**
  * Lädt CSV-Daten von einer Quelle
- * * @param string $source 'dropbox' oder 'local'
+ * @param string $source 'dropbox' oder 'local'
  * @param array $config Plugin-Konfiguration
  * @return array CSV-Daten als Array
  */
@@ -765,7 +765,7 @@ function csv_import_detect_csv_delimiter( string $csv_content ): string {
 
 /**
  * Startet den CSV-Import mit erweiterten Sicherheitschecks (Hauptfunktion)
- * * @param string $source 'dropbox' oder 'local'
+ * @param string $source 'dropbox' oder 'local'
  * @param array $config Import-Konfiguration
  * @return array Import-Ergebnis
  */
@@ -894,35 +894,37 @@ function csv_import_process_data( array $csv_data, array $config, string $sessio
             csv_import_update_progress( $processed, $total, 'processing' );
             
             // Post erstellen
-            $post_id = csv_import_create_post_from_row( $row, $config, $session_id );
+            $post_result = csv_import_create_post_from_row( $row, $config, $session_id );
             
-            if ( $post_id && ! is_wp_error( $post_id ) ) {
-                $created_posts[] = $post_id;
+            if ( $post_result === 'created' ) {
+                $created_posts[] = $post_result;
                 $processed++;
-                
-                // Alle 10 Posts einen kleinen Break
-                if ( $processed % 10 === 0 ) {
-                    usleep( 100000 ); // 0.1 Sekunde
-                }
-                
-            } else {
-                $errors++;
-                $error_msg = is_wp_error( $post_id ) ? $post_id->get_error_message() : 'Unbekannter Fehler';
-                $error_messages[] = "Zeile " . ($index + 2) . ": " . $error_msg;
-                
-                csv_import_log( 'warning', "Fehler beim Erstellen des Posts (Zeile " . ($index + 2) . "): " . $error_msg, [
-                    'row_data' => $row
-                ] );
+            } elseif ( $post_result === 'skipped' ) {
+                // Übersprungene Posts nicht als Fehler zählen
+            }
+            
+            $processed++;
+            
+            // Kurze Pause alle 10 Posts
+            if ( $processed % 10 === 0 ) {
+                usleep( 100000 ); // 0.1 Sekunde
             }
             
         } catch ( Exception $e ) {
             $errors++;
-            $error_messages[] = "Zeile " . ($index + 2) . ": " . $e->getMessage();
+            $error_msg = "Zeile " . ($index + 2) . ": " . $e->getMessage();
+            $error_messages[] = $error_msg;
             
-            csv_import_log( 'warning', "Exception beim Verarbeiten der Zeile " . ($index + 2) . ": " . $e->getMessage(), [
+            csv_import_log( 'warning', $error_msg, [
                 'row_data' => $row,
-                'trace' => $e->getTraceAsString()
+                'session_id' => $session_id
             ] );
+            
+            // Maximale Fehleranzahl erreicht?
+            if ( $errors > 50 ) {
+                csv_import_log( 'error', 'Import abgebrochen - zu viele Fehler (>50)' );
+                break;
+            }
         }
     }
     
@@ -940,7 +942,7 @@ function csv_import_process_data( array $csv_data, array $config, string $sessio
 /**
  * Erstellt einen WordPress-Post aus einer CSV-Zeile
  */
-function csv_import_create_post_from_row( array $row, array $config, string $session_id ): int {
+function csv_import_create_post_from_row( array $row, array $config, string $session_id ) {
     // Basis-Post-Daten zusammenstellen
     $post_title = csv_import_sanitize_title( $row['post_title'] ?? $row['title'] ?? 'Untitled' );
     $post_content = $row['post_content'] ?? $row['content'] ?? '';
@@ -955,7 +957,7 @@ function csv_import_create_post_from_row( array $row, array $config, string $ses
     if ( $config['skip_duplicates'] ) {
         $existing_post = get_page_by_title( $post_title, OBJECT, $config['post_type'] );
         if ( $existing_post ) {
-            throw new Exception( "Post bereits vorhanden: {$post_title}" );
+            return 'skipped'; // Duplikat übersprungen
         }
     }
     
@@ -982,7 +984,7 @@ function csv_import_create_post_from_row( array $row, array $config, string $ses
     $post_id = wp_insert_post( $post_data );
     
     if ( is_wp_error( $post_id ) ) {
-        return $post_id;
+        throw new Exception( 'WordPress Fehler: ' . $post_id->get_error_message() );
     }
     
     // Meta-Felder hinzufügen
@@ -998,7 +1000,7 @@ function csv_import_create_post_from_row( array $row, array $config, string $ses
         csv_import_add_seo_data( $post_id, $row, $config );
     }
     
-    return $post_id;
+    return 'created';
 }
 
 /**
@@ -1501,47 +1503,6 @@ function csv_import_get_file_status( string $path, bool $is_dir = false ): strin
     }
 }
 
-/**
- * Zeigt Import-Status-Widget im Admin-Dashboard
- */
-function csv_import_dashboard_widget() {
-    $progress = csv_import_get_progress();
-    $stats = csv_import_get_stats();
-    $health = csv_import_system_health_check();
-    
-    echo '<div class="csv-import-dashboard-widget">';
-    
-    if ( $progress['running'] ) {
-        echo '<div class="import-status running">';
-        echo '<h4>🔄 Import läuft gerade</h4>';
-        echo '<div class="progress-bar">';
-        echo '<div class="progress-fill" style="width: ' . $progress['percent'] . '%"></div>';
-        echo '</div>';
-        echo '<p>' . $progress['message'] . '</p>';
-        if ( isset( $progress['eta_human'] ) ) {
-            echo '<p><small>Geschätzte Restzeit: ' . $progress['eta_human'] . '</small></p>';
-        }
-        echo '</div>';
-    } else {
-        echo '<div class="import-status idle">';
-        echo '<h4>💤 Kein aktiver Import</h4>';
-        echo '<p>Letzter Import: ' . ( $stats['last_run'] !== 'Nie' ? date( 'Y-m-d H:i', strtotime( $stats['last_run'] ) ) : 'Nie' ) . '</p>';
-        echo '<p>Gesamt importiert: ' . number_format( $stats['total_imported'] ) . ' Einträge</p>';
-        echo '</div>';
-    }
-    
-    // Health Status
-    $health_issues = array_filter( $health, function( $value ) { return $value === false; } );
-    if ( ! empty( $health_issues ) ) {
-        echo '<div class="health-status issues">';
-        echo '<h4>⚠️ System-Probleme erkannt</h4>';
-        echo '<p><a href="' . admin_url( 'tools.php?page=csv-import-logs' ) . '">System-Check anzeigen</a></p>';
-        echo '</div>';
-    }
-    
-    echo '</div>';
-}
-
 // ===================================================================
 // HILFSFUNKTIONEN
 // ===================================================================
@@ -1993,15 +1954,8 @@ if ( ! wp_next_scheduled( 'csv_import_weekly_maintenance' ) ) {
 add_action( 'csv_import_daily_maintenance', 'csv_import_daily_maintenance' );
 add_action( 'csv_import_weekly_maintenance', 'csv_import_weekly_maintenance' );
 
-// Dashboard Widget registrieren
-add_action( 'wp_dashboard_setup', function() {
-    if ( current_user_can( 'manage_options' ) ) {
-        wp_add_dashboard_widget(
-            'csv_import_status_widget',
-            'CSV Import Status',
-            'csv_import_dashboard_widget'
-        );
-    }
-} );
+// ===================================================================
+// ABSCHLUSS
+// ===================================================================
 
-csv_import_log( 'debug', 'CSV Import Pro Core Functions geladen - Version 5.2' );
+csv_import_log( 'debug', 'CSV Import Pro Core Functions geladen - Version 5.2 (Dashboard Widget bereinigt)' );
