@@ -1,10 +1,17 @@
 <?php
 /**
  * View-Datei für das Haupt-Import-Dashboard.
+ * MODIFIZIERT: Permanenter Notfall-Reset-Button hinzugefügt.
  */
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
+
+// URL für den Notfall-Reset sicher mit einem Nonce generieren
+$reset_url = wp_nonce_url(
+    add_query_arg('csv_emergency_reset', '1', admin_url('tools.php?page=csv-import')),
+    'csv_import_emergency_reset'
+);
 ?>
 <div class="wrap">
 	<h1>CSV Import für Landingpages</h1>
@@ -144,6 +151,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 			<a href="<?php echo esc_url( admin_url( 'tools.php?page=csv-import-settings' ) ); ?>"
 			   class="button button-secondary">⚙️ Alle Einstellungen</a>
 			<button type="button" class="button button-secondary" onclick="location.reload();">🔄 Seite aktualisieren</button>
+			
+            <a href="<?php echo esc_url( $reset_url ); ?>"
+               class="button"
+               style="background-color: #d63638; color: white; border-color: #b02a2c; text-shadow: none; float: right;"
+               onclick="return confirm('WARNUNG:\n\nDies setzt alle laufenden Importe zurück und löscht den Fortschritt.\n\nFühren Sie dies nur aus, wenn das System blockiert ist.\n\nSind Sie sicher?');">
+               🚨 Notfall-Reset
+            </a>
 		</div>
 	</div>
 </div>
