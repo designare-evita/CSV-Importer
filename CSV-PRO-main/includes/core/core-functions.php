@@ -706,7 +706,7 @@ function csv_import_cleanup_database( $force_cleanup = false ) {
     $option_patterns = [
         'csv_import_%',
         '%csv_import_%',
-        'csv_export_%', // Falls vorhanden
+        'csv_export_%', 
         '%backup_csv_%'
     ];
     
