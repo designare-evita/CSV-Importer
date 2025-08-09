@@ -39,6 +39,7 @@ function csv_import_check_stuck_imports() {
 
 /**
  * Erzwingt das Zurücksetzen des Import-Status (Notfall-Reset)
+ * NEU: Inklusive Cache-Flush für hartnäckige Sperren.
  */
 function csv_import_force_reset_import_status() {
     // Schritt 1: WordPress Object Cache leeren (gegen Redis/Memcached)
@@ -67,13 +68,7 @@ function csv_import_force_reset_import_status() {
     
     csv_import_log('info', 'Import-Status wurde komplett zurückgesetzt (Notfall-Reset inkl. Cache-Flush)');
 }
-    
-    // Import-Lock aus der Datenbank entfernen
-    global $wpdb;
-    $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '%csv_import%lock%'");
-    
-    csv_import_log('info', 'Import-Status wurde komplett zurückgesetzt (Notfall-Reset)');
-}
+
 
 /**
  * Sicherer Import-Status Check mit automatischer Bereinigung
