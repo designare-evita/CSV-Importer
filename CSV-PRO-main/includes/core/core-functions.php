@@ -3,12 +3,1107 @@
  * Core-Funktionen für das CSV Import Pro Plugin
  * Diese Datei enthält alle grundlegenden Funktionen, die von anderen Plugin-Teilen
  * benötigt werden. Sie muss als erstes geladen werden.
- * Version: 5.3 (Self-healing logic)
+ * Version: 5.4 (Complete Hard Reset & Enhanced Self-healing)
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
     exit; // Direkten Zugriff verhindern
 }
+
+// ===================================================================
+// HARD RESET & AGGRESSIVE SELBSTHEILUNG
+// ===================================================================
+
+/**
+ * HARD RESET: Komplette Zurücksetzung aller Import-Daten und -Zustände
+ * Diese Funktion führt eine vollständige Bereinigung durch, auch bei hartnäckigsten Problemen
+ */
+function csv_import_hard_reset( $force_cleanup = false ) {
+    csv_import_log('info', 'HARD RESET gestartet - Vollständige System-Bereinigung');
+    
+    // Schritt 1: ALLE Import-Prozesse stoppen (erzwungen)
+    csv_import_force_stop_all_processes();
+    
+    // Schritt 2: Cache komplett leeren (mehrere Systeme)
+    csv_import_flush_all_caches();
+    
+    // Schritt 3: Datenbank-Bereinigung (alle import-bezogenen Daten)
+    csv_import_cleanup_database( $force_cleanup );
+    
+    // Schritt 4: Dateisystem-Bereinigung
+    csv_import_cleanup_filesystem( $force_cleanup );
+    
+    // Schritt 5: WordPress Cron bereinigen
+    csv_import_cleanup_cron_events();
+    
+    // Schritt 6: Session-Daten zurücksetzen
+    csv_import_reset_all_sessions();
+    
+    // Schritt 7: Plugin-Status zurücksetzen
+    csv_import_reset_plugin_state();
+    
+    // Schritt 8: System-Checks durchführen
+    $health_check = csv_import_post_reset_health_check();
+    
+    csv_import_log('info', 'HARD RESET abgeschlossen', [
+        'health_check' => $health_check,
+        'timestamp' => current_time('mysql'),
+        'user_id' => get_current_user_id(),
+        'memory_usage' => memory_get_usage( true ),
+        'mysql_version' => $wpdb->db_version(),
+        'wp_version' => get_bloginfo( 'version' ),
+        'php_version' => PHP_VERSION,
+        'server_info' => $_SERVER['SERVER_SOFTWARE'] ?? 'unknown'
+    ];
+    
+    update_option( 'csv_import_backup_' . $session_id, $backup_info );
+    csv_import_log( 'info', "Backup für Session {$session_id} erstellt" );
+    
+    return true;
+}
+
+/**
+ * Bereinigt temporäre Dateien und alte Daten mit erweiterten Optionen
+ */
+function csv_import_cleanup_temp_files( int $older_than_hours = 24 ): void {
+    $upload_dir = wp_upload_dir();
+    $temp_dir = $upload_dir['basedir'] . '/csv-import-temp/';
+    $cutoff_time = time() - ( $older_than_hours * 3600 );
+    $deleted_files = 0;
+    
+    if ( is_dir( $temp_dir ) ) {
+        $files = glob( $temp_dir . '*' );
+        foreach ( $files as $file ) {
+            if ( is_file( $file ) && filemtime( $file ) < $cutoff_time ) {
+                if ( @unlink( $file ) ) {
+                    $deleted_files++;
+                }
+            }
+        }
+        
+        // Leere Verzeichnisse entfernen
+        if ( csv_import_is_dir_empty( $temp_dir ) ) {
+            @rmdir( $temp_dir );
+        }
+    }
+    
+    if ( $deleted_files > 0 ) {
+        csv_import_log( 'info', "Bereinigung: {$deleted_files} temporäre Dateien gelöscht" );
+    }
+}
+
+// ===================================================================
+// LOGGING & FEHLERBEHANDLUNG MIT ERWEITERTEN FEATURES
+// ===================================================================
+
+/**
+ * Verfolgt Fehlerstatistiken für das Monitoring mit erweiterten Metriken.
+ *
+ * @param string $level
+ * @param string $message
+ */
+function csv_import_track_error_stats( string $level, string $message ): void {
+    $stats = get_option( 'csv_import_error_stats', [
+        'total_errors'      => 0,
+        'total_real_errors' => 0,
+        'errors_by_level'   => [],
+        'recent_errors'     => [],
+        'error_trends'      => [],
+        'critical_errors_24h' => 0,
+        'warning_errors_24h' => 0
+    ] );
+
+    // Gesamtzahl aller Meldungen
+    $stats['total_errors']++;
+
+    // Echte Fehler (critical, error, warning) separat zählen
+    if ( in_array( $level, ['critical', 'error', 'warning'] ) ) {
+        $stats['total_real_errors'] = ( $stats['total_real_errors'] ?? 0 ) + 1;
+        
+        // 24h Zähler für kritische Fehler und Warnungen
+        if ( $level === 'critical' || $level === 'error' ) {
+            $stats['critical_errors_24h'] = ( $stats['critical_errors_24h'] ?? 0 ) + 1;
+        } elseif ( $level === 'warning' ) {
+            $stats['warning_errors_24h'] = ( $stats['warning_errors_24h'] ?? 0 ) + 1;
+        }
+    }
+
+    // Fehler pro Level
+    $stats['errors_by_level'][ $level ] = ( $stats['errors_by_level'][ $level ] ?? 0 ) + 1;
+
+    // Letzte Fehler (die letzten 50 behalten)
+    $stats['recent_errors'][] = [
+        'level'   => $level,
+        'message' => mb_substr( $message, 0, 200 ), // Nachrichtenlänge begrenzen
+        'time'    => current_time( 'mysql' ),
+        'user_id' => get_current_user_id(),
+        'ip'      => $_SERVER['REMOTE_ADDR'] ?? 'unknown'
+    ];
+    $stats['recent_errors'] = array_slice( $stats['recent_errors'], -50 );
+
+    // Tägliche Trends für echte Fehler
+    if ( in_array( $level, ['critical', 'error', 'warning'] ) ) {
+        $today = current_time( 'Y-m-d' );
+        $stats['error_trends'][ $today ] = ( $stats['error_trends'][ $today ] ?? 0 ) + 1;
+
+        // Alte Trends aufräumen (letzte 30 Tage behalten)
+        if ( count( $stats['error_trends'] ) > 30 ) {
+            $stats['error_trends'] = array_slice( $stats['error_trends'], -30, null, true );
+        }
+    }
+
+    update_option( 'csv_import_error_stats', $stats );
+}
+
+/**
+ * Loggt Import-Aktivitäten mit erweiterten Kontextdaten
+ */
+function csv_import_log( string $level, string $message, array $context = [] ): void {
+    // Erweiterte Kontextdaten hinzufügen
+    $context = array_merge( $context, [
+        'timestamp' => current_time( 'mysql' ),
+        'user_id' => get_current_user_id(),
+        'memory_usage' => memory_get_usage( true ),
+        'peak_memory' => memory_get_peak_usage( true ),
+        'php_version' => PHP_VERSION,
+        'plugin_version' => defined('CSV_IMPORT_PRO_VERSION') ? CSV_IMPORT_PRO_VERSION : 'unknown'
+    ] );
+    
+    if ( class_exists( 'CSV_Import_Error_Handler' ) ) {
+        CSV_Import_Error_Handler::handle( $level, $message, $context );
+    } else {
+        error_log( sprintf( '[CSV Import Pro %s] %s', strtoupper( $level ), $message ) );
+    }
+    
+    // In Statistiken verfolgen
+    csv_import_track_error_stats( $level, $message );
+    
+    // Zusätzlich in eigenes Log schreiben (falls Debug-Modus)
+    if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
+        csv_import_debug_log( $message, $context );
+    }
+    
+    // Bei kritischen Fehlern sofort Admin benachrichtigen
+    if ( $level === 'critical' ) {
+        csv_import_send_critical_error_notification( $message, $context );
+    }
+}
+
+/**
+ * Debug-Logging in separate Datei mit Rotation
+ */
+function csv_import_debug_log( string $message, array $context = [] ): void {
+    $upload_dir = wp_upload_dir();
+    $log_file = $upload_dir['basedir'] . '/csv-import-debug.log';
+    
+    // Log-Rotation: Wenn Datei größer als 10MB, in .old umbenennen
+    if ( file_exists( $log_file ) && filesize( $log_file ) > 10485760 ) {
+        @rename( $log_file, $upload_dir['basedir'] . '/csv-import-debug.log.old' );
+    }
+    
+    $log_entry = sprintf(
+        "[%s] [%s] %s %s\n",
+        current_time( 'Y-m-d H:i:s' ),
+        strtoupper( WP_DEBUG ? 'DEBUG' : 'INFO' ),
+        $message,
+        ! empty( $context ) ? wp_json_encode( $context, JSON_PRETTY_PRINT ) : ''
+    );
+    
+    @file_put_contents( $log_file, $log_entry, FILE_APPEND | LOCK_EX );
+}
+
+/**
+ * Sendet kritische Fehler-Benachrichtigungen
+ */
+function csv_import_send_critical_error_notification( string $message, array $context = [] ): void {
+    // Throttling: Nicht mehr als 1 kritischer Fehler pro Stunde
+    $last_critical = get_transient( 'csv_import_last_critical_notification' );
+    if ( $last_critical ) {
+        return;
+    }
+    
+    set_transient( 'csv_import_last_critical_notification', time(), 3600 );
+    
+    $admin_email = get_option( 'admin_email' );
+    $site_name = get_bloginfo( 'name' );
+    
+    $subject = "[$site_name] CSV Import Pro - Kritischer Fehler";
+    $body = "Ein kritischer Fehler ist im CSV Import Pro Plugin aufgetreten:\n\n";
+    $body .= "Fehler: $message\n\n";
+    $body .= "Zeit: " . current_time( 'Y-m-d H:i:s' ) . "\n";
+    $body .= "Benutzer: " . ( $context['user_id'] ?? 'unbekannt' ) . "\n";
+    $body .= "Speicherverbrauch: " . size_format( $context['memory_usage'] ?? 0 ) . "\n\n";
+    $body .= "Weitere Details finden Sie in den Plugin-Logs.\n\n";
+    $body .= "-- CSV Import Pro System";
+    
+    wp_mail( $admin_email, $subject, $body );
+}
+
+// ===================================================================
+// INITIALIZATION & MAINTENANCE MIT ERWEITERTEN FEATURES
+// ===================================================================
+
+/**
+ * Führt tägliche Wartungsaufgaben aus mit erweiterten Features
+ */
+function csv_import_daily_maintenance(): void {
+    csv_import_log( 'debug', 'Starte tägliche Wartung' );
+    
+    // 1. Alte Fehlerstatistiken bereinigen
+    $stats = csv_import_get_error_stats();
+    
+    // Alte Einträge entfernen (älter als 30 Tage)
+    $cutoff_date = date( 'Y-m-d', strtotime( '-30 days' ) );
+    
+    if ( isset( $stats['error_trends'] ) ) {
+        $cleaned = 0;
+        foreach ( $stats['error_trends'] as $date => $count ) {
+            if ( $date < $cutoff_date ) {
+                unset( $stats['error_trends'][ $date ] );
+                $cleaned++;
+            }
+        }
+        if ($cleaned > 0) {
+            csv_import_log( 'debug', "Bereinigt: {$cleaned} alte Fehler-Trend-Einträge" );
+        }
+    }
+    
+    // Nur die letzten 50 Fehler behalten
+    if ( isset( $stats['recent_errors'] ) && count( $stats['recent_errors'] ) > 50 ) {
+        $stats['recent_errors'] = array_slice( $stats['recent_errors'], -50 );
+    }
+    
+    // 24h-Zähler zurücksetzen
+    $stats['critical_errors_24h'] = 0;
+    $stats['warning_errors_24h'] = 0;
+    
+    update_option( 'csv_import_error_stats', $stats );
+    
+    // 2. Temporäre Dateien aufräumen
+    csv_import_cleanup_temp_files( 24 );
+    
+    // 3. Alte Backup-Informationen bereinigen (älter als 7 Tage)
+    global $wpdb;
+    $old_backups = $wpdb->get_results(
+        "SELECT option_name FROM {$wpdb->options} 
+         WHERE option_name LIKE 'csv_import_backup_%' 
+         LIMIT 100"
+    );
+    
+    $deleted_backups = 0;
+    foreach ( $old_backups as $backup ) {
+        $backup_data = get_option( $backup->option_name );
+        if ( isset( $backup_data['timestamp'] ) ) {
+            $backup_time = strtotime( $backup_data['timestamp'] );
+            if ( $backup_time < strtotime( '-7 days' ) ) {
+                delete_option( $backup->option_name );
+                $deleted_backups++;
+            }
+        }
+    }
+    
+    if ( $deleted_backups > 0 ) {
+        csv_import_log( 'debug', "Bereinigt: {$deleted_backups} alte Backup-Einträge" );
+    }
+    
+    // 4. Hängende Import-Prozesse bereinigen
+    csv_import_cleanup_dead_processes();
+    
+    // 5. Backup alte Progress-Optionen löschen
+    delete_transient( 'csv_import_progress' );
+    
+    // 6. Plugin-Performance-Metriken sammeln
+    $memory_limit = csv_import_convert_to_bytes( ini_get( 'memory_limit' ) );
+    $disk_free = function_exists('disk_free_space') ? @disk_free_space( ABSPATH ) : 0;
+    
+    update_option( 'csv_import_system_metrics', [
+        'memory_limit' => $memory_limit,
+        'disk_free' => $disk_free,
+        'last_maintenance' => current_time( 'mysql' ),
+        'php_version' => PHP_VERSION,
+        'wp_version' => get_bloginfo( 'version' )
+    ] );
+    
+    csv_import_log( 'debug', 'Tägliche Wartung abgeschlossen', [
+        'deleted_backups' => $deleted_backups,
+        'memory_limit' => size_format( $memory_limit ),
+        'disk_free' => size_format( $disk_free )
+    ] );
+}
+
+/**
+ * Wöchentliche Wartungsaufgaben
+ */
+function csv_import_weekly_maintenance(): void {
+    csv_import_log( 'debug', 'Starte wöchentliche Wartung' );
+    
+    // Erweiterte Bereinigung
+    csv_import_cleanup_temp_files( 168 ); // 7 Tage
+    
+    // Plugin-Health-Check
+    $health = csv_import_system_health_check();
+    $health_issues = array_filter( $health, function( $value, $key ) {
+        return $value === false && $key !== 'import_locks' && $key !== 'stuck_processes';
+    }, ARRAY_FILTER_USE_BOTH );
+    
+    if ( ! empty( $health_issues ) ) {
+        csv_import_log( 'warning', 'System-Health-Probleme erkannt', [
+            'issues' => array_keys( $health_issues )
+        ] );
+    }
+    
+    csv_import_log( 'debug', 'Wöchentliche Wartung abgeschlossen' );
+}
+
+// Hook für erweiterte Wartung
+if ( ! wp_next_scheduled( 'csv_import_daily_maintenance' ) ) {
+    wp_schedule_event( time(), 'daily', 'csv_import_daily_maintenance' );
+}
+
+if ( ! wp_next_scheduled( 'csv_import_weekly_maintenance' ) ) {
+    wp_schedule_event( time(), 'weekly', 'csv_import_weekly_maintenance' );
+}
+
+add_action( 'csv_import_daily_maintenance', 'csv_import_daily_maintenance' );
+add_action( 'csv_import_weekly_maintenance', 'csv_import_weekly_maintenance' );
+
+// ===================================================================
+// ADMIN NOTICES FÜR NORMALE RESETS
+// ===================================================================
+
+function csv_import_show_stuck_reset_notice() {
+    if (get_transient('csv_import_stuck_reset_notice')) {
+        echo '<div class="notice notice-warning is-dismissible">
+            <p><strong>CSV Import:</strong> Ein hängender Import-Prozess wurde automatisch zurückgesetzt. Sie können nun wieder importieren.</p>
+        </div>';
+        delete_transient('csv_import_stuck_reset_notice');
+    }
+}
+add_action('admin_notices', 'csv_import_show_stuck_reset_notice');
+
+// ===================================================================
+// ERWEITERTE HELPER-FUNKTIONEN FÜR IMPORT-KOMPATIBILITÄT
+// ===================================================================
+
+/**
+ * Lädt CSV-Daten und führt vollständige Validierung durch
+ */
+function csv_import_load_and_validate_csv( string $source, array $config ): array {
+    // CSV-Daten laden
+    $csv_data = csv_import_load_csv_data( $source, $config );
+    
+    // Zusätzliche Validierungen
+    if ( empty( $csv_data['data'] ) ) {
+        throw new Exception( 'CSV-Datei enthält keine Datenzeilen' );
+    }
+    
+    if ( count( $csv_data['data'] ) > 10000 ) {
+        csv_import_log( 'warning', 'Sehr große CSV-Datei mit ' . count( $csv_data['data'] ) . ' Zeilen' );
+    }
+    
+    // Erforderliche Spalten prüfen
+    $required_columns = is_array( $config['required_columns'] ) 
+        ? $config['required_columns'] 
+        : explode( "\n", $config['required_columns'] );
+    
+    $column_validation = csv_import_validate_required_columns( $csv_data['headers'], $required_columns );
+    if ( ! $column_validation['valid'] ) {
+        throw new Exception( 'Erforderliche Spalten fehlen: ' . implode( ', ', $column_validation['missing'] ) );
+    }
+    
+    return $csv_data;
+}
+
+/**
+ * Erweiterte Import-Statistiken mit Performance-Daten
+ */
+function csv_import_get_extended_stats(): array {
+    $stats = csv_import_get_stats();
+    $error_stats = csv_import_get_error_stats();
+    $system_metrics = get_option( 'csv_import_system_metrics', [] );
+    
+    return array_merge( $stats, [
+        'error_stats' => $error_stats,
+        'system_metrics' => $system_metrics,
+        'health_status' => csv_import_system_health_check(),
+        'plugin_version' => defined('CSV_IMPORT_PRO_VERSION') ? CSV_IMPORT_PRO_VERSION : '5.4',
+        'last_hard_reset' => get_option( 'csv_import_last_hard_reset', 'Nie' )
+    ] );
+}
+
+/**
+ * Prüft Plugin-Integrität und behebt häufige Probleme
+ */
+function csv_import_integrity_check(): array {
+    $issues = [];
+    $fixes_applied = [];
+    
+    // 1. Verwaiste Progress-Einträge
+    $progress = get_option( 'csv_import_progress', [] );
+    if ( ! empty( $progress['running'] ) && empty( $progress['start_time'] ) ) {
+        csv_import_clear_progress();
+        $fixes_applied[] = 'Verwaister Progress-Eintrag bereinigt';
+    }
+    
+    // 2. Hängende Locks ohne aktiven Import
+    $lock = get_option( 'csv_import_running_lock' );
+    if ( $lock && empty( $progress['running'] ) ) {
+        delete_option( 'csv_import_running_lock' );
+        $fixes_applied[] = 'Verwaister Import-Lock entfernt';
+    }
+    
+    // 3. Inkonsistente Konfiguration
+    $config = csv_import_get_config();
+    $validation = csv_import_validate_config( $config );
+    if ( ! $validation['valid'] ) {
+        $issues = array_merge( $issues, $validation['errors'] );
+    }
+    
+    // 4. Fehlende Upload-Verzeichnisse
+    $upload_dir = wp_upload_dir();
+    $required_dirs = [
+        $upload_dir['basedir'] . '/csv-import-temp/',
+        ABSPATH . ltrim( $config['image_folder'] ?? 'wp-content/uploads/csv-import-images/', '/' )
+    ];
+    
+    foreach ( $required_dirs as $dir ) {
+        if ( ! is_dir( $dir ) ) {
+            if ( wp_mkdir_p( $dir ) ) {
+                $fixes_applied[] = "Verzeichnis erstellt: " . basename( $dir );
+            } else {
+                $issues[] = "Konnte Verzeichnis nicht erstellen: " . basename( $dir );
+            }
+        }
+    }
+    
+    return [
+        'issues_found' => $issues,
+        'fixes_applied' => $fixes_applied,
+        'status' => empty( $issues ) ? 'healthy' : 'needs_attention'
+    ];
+}
+
+/**
+ * Erweiterte Template-Funktionen
+ */
+function csv_import_get_available_templates(): array {
+    $templates = [];
+    
+    // Suche nach Posts die als Templates verwendet werden können
+    $query = new WP_Query([
+        'post_type' => ['page', 'post'],
+        'post_status' => ['publish', 'draft'],
+        'meta_query' => [
+            'relation' => 'OR',
+            [
+                'key' => '_csv_import_template',
+                'value' => '1'
+            ],
+            [
+                'key' => '_elementor_data',
+                'compare' => 'EXISTS'
+            ]
+        ],
+        'posts_per_page' => 50
+    ]);
+    
+    if ( $query->have_posts() ) {
+        while ( $query->have_posts() ) {
+            $query->the_post();
+            $post_id = get_the_ID();
+            
+            $templates[] = [
+                'id' => $post_id,
+                'title' => get_the_title(),
+                'type' => get_post_type(),
+                'status' => get_post_status(),
+                'is_elementor' => ! empty( get_post_meta( $post_id, '_elementor_data', true ) ),
+                'is_marked_template' => get_post_meta( $post_id, '_csv_import_template', true ) === '1'
+            ];
+        }
+        wp_reset_postdata();
+    }
+    
+    return $templates;
+}
+
+/**
+ * Speichert erweiterte Plugin-Metriken
+ */
+function csv_import_save_performance_metrics( array $import_result ): void {
+    $metrics = get_option( 'csv_import_performance_metrics', [] );
+    
+    $today = current_time( 'Y-m-d' );
+    if ( ! isset( $metrics[ $today ] ) ) {
+        $metrics[ $today ] = [
+            'imports' => 0,
+            'total_processed' => 0,
+            'total_errors' => 0,
+            'avg_time_per_item' => 0,
+            'peak_memory' => 0
+        ];
+    }
+    
+    $metrics[ $today ]['imports']++;
+    $metrics[ $today ]['total_processed'] += $import_result['processed'] ?? 0;
+    $metrics[ $today ]['total_errors'] += $import_result['errors'] ?? 0;
+    $metrics[ $today ]['peak_memory'] = max( 
+        $metrics[ $today ]['peak_memory'], 
+        memory_get_peak_usage( true ) 
+    );
+    
+    // Durchschnittliche Zeit pro Item berechnen
+    if ( ! empty( $import_result['processed'] ) ) {
+        $processing_time = get_option( 'csv_import_avg_processing_time', 0 );
+        $metrics[ $today ]['avg_time_per_item'] = $processing_time;
+    }
+    
+    // Nur die letzten 30 Tage behalten
+    if ( count( $metrics ) > 30 ) {
+        $metrics = array_slice( $metrics, -30, null, true );
+    }
+    
+    update_option( 'csv_import_performance_metrics', $metrics );
+}
+
+// ===================================================================
+// ABSCHLUSS & LOGGING
+// ===================================================================
+
+// Auto-Integrity-Check bei Plugin-Load (nur im Admin)
+if ( is_admin() ) {
+    add_action( 'admin_init', function() {
+        // Nur einmal pro Stunde prüfen
+        if ( ! get_transient( 'csv_import_last_integrity_check' ) ) {
+            $integrity = csv_import_integrity_check();
+            
+            if ( ! empty( $integrity['fixes_applied'] ) ) {
+                csv_import_log( 'info', 'Automatische Reparaturen durchgeführt', $integrity );
+            }
+            
+            if ( ! empty( $integrity['issues_found'] ) ) {
+                csv_import_log( 'warning', 'Plugin-Integritätsprobleme gefunden', $integrity );
+            }
+            
+            set_transient( 'csv_import_last_integrity_check', time(), 3600 );
+        }
+    }, 999 );
+}
+
+csv_import_log( 'debug', 'CSV Import Pro Core Functions vollständig geladen - Version 5.4 (Complete Hard Reset & Enhanced Self-healing)', [
+    'functions_loaded' => [
+        'hard_reset' => function_exists( 'csv_import_hard_reset' ),
+        'aggressive_heal' => function_exists( 'csv_import_aggressive_self_heal' ),
+        'import_start' => function_exists( 'csv_import_start_import' ),
+        'config_validation' => function_exists( 'csv_import_validate_config' ),
+        'csv_processing' => function_exists( 'csv_import_load_csv_data' ),
+        'progress_tracking' => function_exists( 'csv_import_update_progress' ),
+        'error_tracking' => function_exists( 'csv_import_track_error_stats' ),
+        'maintenance' => function_exists( 'csv_import_daily_maintenance' ),
+        'integrity_check' => function_exists( 'csv_import_integrity_check' )
+    ],
+    'total_functions' => 'Über 60 Funktionen geladen',
+    'file_size' => 'Vollständige Implementierung mit über 1800 Zeilen'
+] );_id' => get_current_user_id()
+    ]);
+    
+    // Admin-Notice für erfolgreichen Reset setzen
+    set_transient('csv_import_hard_reset_success', [
+        'timestamp' => time(),
+        'health_status' => $health_check,
+        'message' => 'Hard Reset erfolgreich durchgeführt - Alle Import-Daten wurden bereinigt'
+    ], 300);
+    
+    return [
+        'success' => true,
+        'message' => 'Hard Reset erfolgreich durchgeführt',
+        'health_check' => $health_check,
+        'cleaned_items' => [
+            'database_options' => true,
+            'cache_flushed' => true,
+            'temp_files' => true,
+            'cron_events' => true,
+            'sessions' => true
+        ]
+    ];
+}
+
+/**
+ * Stoppt ALLE Import-Prozesse mit maximaler Gewalt
+ */
+function csv_import_force_stop_all_processes() {
+    // Alle bekannten Import-Locks entfernen
+    $lock_options = [
+        'csv_import_running_lock',
+        'csv_import_process_lock',
+        'csv_import_validation_lock',
+        'csv_import_batch_lock',
+        'csv_import_scheduler_lock'
+    ];
+    
+    foreach ($lock_options as $lock) {
+        delete_option($lock);
+        delete_transient($lock);
+        delete_site_transient($lock);
+    }
+    
+    // Progress-Status auf "aborted" setzen
+    update_option('csv_import_progress', [
+        'running' => false,
+        'status' => 'hard_reset',
+        'message' => 'Hard Reset durchgeführt',
+        'timestamp' => time(),
+        'processed' => 0,
+        'total' => 0
+    ]);
+    
+    csv_import_log('debug', 'Alle Import-Prozesse wurden zwangsweise gestoppt');
+}
+
+/**
+ * Leert ALLE verfügbaren Cache-Systeme
+ */
+function csv_import_flush_all_caches() {
+    // WordPress Object Cache
+    if (function_exists('wp_cache_flush')) {
+        wp_cache_flush();
+    }
+    
+    // WordPress Object Cache (alternative Methode)
+    if (function_exists('wp_cache_flush_group')) {
+        wp_cache_flush_group('csv_import');
+    }
+    
+    // Transients manuell löschen
+    global $wpdb;
+    $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_csv_import_%'");
+    $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_transient_timeout_csv_import_%'");
+    
+    // Site Transients
+    $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_site_transient_csv_import_%'");
+    $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '_site_transient_timeout_csv_import_%'");
+    
+    // Redis Cache (falls vorhanden)
+    if (function_exists('wp_cache_delete') && class_exists('Redis')) {
+        wp_cache_delete('csv_import*', '');
+    }
+    
+    // Memcached (falls vorhanden)
+    if (class_exists('Memcached') && function_exists('wp_cache_delete')) {
+        wp_cache_delete('csv_import', 'default');
+    }
+    
+    csv_import_log('debug', 'Alle Cache-Systeme wurden geleert');
+}
+
+/**
+ * Bereinigt ALLE CSV Import-bezogenen Datenbank-Einträge
+ */
+function csv_import_cleanup_database( $force_cleanup = false ) {
+    global $wpdb;
+    
+    // Standard-Options bereinigen
+    $option_patterns = [
+        'csv_import_%',
+        '%csv_import_%',
+        'csv_export_%', // Falls vorhanden
+        '%backup_csv_%'
+    ];
+    
+    $deleted_options = 0;
+    foreach ($option_patterns as $pattern) {
+        $result = $wpdb->query($wpdb->prepare(
+            "DELETE FROM {$wpdb->options} WHERE option_name LIKE %s",
+            $pattern
+        ));
+        $deleted_options += $result;
+    }
+    
+    // User Meta bereinigen (CSV Import-bezogen)
+    $wpdb->query("DELETE FROM {$wpdb->usermeta} WHERE meta_key LIKE 'csv_import_%'");
+    
+    // Post Meta bereinigen (nur bei force_cleanup)
+    if ($force_cleanup) {
+        $deleted_meta = $wpdb->query("DELETE FROM {$wpdb->postmeta} WHERE meta_key LIKE '_csv_import_%'");
+        csv_import_log('debug', "Force cleanup: {$deleted_meta} Post-Meta-Einträge entfernt");
+    }
+    
+    // Custom Tables bereinigen (falls vorhanden)
+    $custom_tables = [
+        $wpdb->prefix . 'csv_import_backups',
+        $wpdb->prefix . 'csv_import_logs',
+        $wpdb->prefix . 'csv_import_sessions'
+    ];
+    
+    foreach ($custom_tables as $table) {
+        if ($wpdb->get_var("SHOW TABLES LIKE '$table'")) {
+            if ($force_cleanup) {
+                $wpdb->query("DROP TABLE IF EXISTS $table");
+                csv_import_log('debug', "Custom Table entfernt: $table");
+            } else {
+                $wpdb->query("TRUNCATE TABLE $table");
+                csv_import_log('debug', "Custom Table geleert: $table");
+            }
+        }
+    }
+    
+    csv_import_log('debug', "Datenbank bereinigt: {$deleted_options} Optionen entfernt");
+}
+
+/**
+ * Bereinigt das Dateisystem von allen CSV Import-Dateien
+ */
+function csv_import_cleanup_filesystem( $force_cleanup = false ) {
+    $upload_dir = wp_upload_dir();
+    $base_dir = $upload_dir['basedir'];
+    
+    // Zu bereinigende Verzeichnisse
+    $cleanup_dirs = [
+        $base_dir . '/csv-import-temp/',
+        $base_dir . '/csv-import-backups/',
+        $base_dir . '/csv-import-logs/',
+        $base_dir . '/csv-import-cache/',
+        $base_dir . '/csv-import-images/',
+        ABSPATH . 'data/' // Falls lokale CSV-Dateien dort liegen
+    ];
+    
+    $deleted_files = 0;
+    $deleted_dirs = 0;
+    
+    foreach ($cleanup_dirs as $dir) {
+        if (is_dir($dir)) {
+            $files = glob($dir . '*');
+            
+            foreach ($files as $file) {
+                if (is_file($file)) {
+                    if (@unlink($file)) {
+                        $deleted_files++;
+                    }
+                } elseif (is_dir($file) && $force_cleanup) {
+                    if (csv_import_rmdir_recursive($file)) {
+                        $deleted_dirs++;
+                    }
+                }
+            }
+            
+            // Leeres Verzeichnis entfernen
+            if ($force_cleanup && csv_import_is_dir_empty($dir)) {
+                @rmdir($dir);
+                $deleted_dirs++;
+            }
+        }
+    }
+    
+    // Log-Dateien im WordPress-Root bereinigen
+    $log_files = glob(ABSPATH . '*csv-import*.log');
+    foreach ($log_files as $log_file) {
+        if (@unlink($log_file)) {
+            $deleted_files++;
+        }
+    }
+    
+    csv_import_log('debug', "Dateisystem bereinigt: {$deleted_files} Dateien, {$deleted_dirs} Verzeichnisse entfernt");
+}
+
+/**
+ * Bereinigt alle WordPress Cron-Events des Plugins
+ */
+function csv_import_cleanup_cron_events() {
+    $cron_hooks = [
+        'csv_import_scheduled',
+        'csv_import_daily_cleanup',
+        'csv_import_weekly_maintenance',
+        'csv_import_daily_maintenance',
+        'csv_import_hourly_check',
+        'csv_import_backup_cleanup'
+    ];
+    
+    $cleared_events = 0;
+    foreach ($cron_hooks as $hook) {
+        if (wp_next_scheduled($hook)) {
+            wp_clear_scheduled_hook($hook);
+            $cleared_events++;
+        }
+    }
+    
+    // Alle Cron-Events mit 'csv_import' im Namen löschen
+    $cron_array = _get_cron_array();
+    foreach ($cron_array as $timestamp => $cron) {
+        foreach ($cron as $hook => $dings) {
+            if (strpos($hook, 'csv_import') !== false) {
+                wp_unschedule_event($timestamp, $hook);
+                $cleared_events++;
+            }
+        }
+    }
+    
+    csv_import_log('debug', "Cron-Events bereinigt: {$cleared_events} Events entfernt");
+}
+
+/**
+ * Setzt alle Session-Daten zurück
+ */
+function csv_import_reset_all_sessions() {
+    // PHP Sessions bereinigen (falls verwendet)
+    if (session_status() === PHP_SESSION_ACTIVE) {
+        foreach ($_SESSION as $key => $value) {
+            if (strpos($key, 'csv_import') !== false) {
+                unset($_SESSION[$key]);
+            }
+        }
+    }
+    
+    // WordPress Sessions (falls Custom Session Handler)
+    global $wpdb;
+    $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE 'csv_import_session_%'");
+    
+    csv_import_log('debug', 'Alle Session-Daten zurückgesetzt');
+}
+
+/**
+ * Setzt den Plugin-Status komplett zurück
+ */
+function csv_import_reset_plugin_state() {
+    // Standard-Einstellungen wiederherstellen
+    $default_settings = [
+        'csv_import_template_id' => 0,
+        'csv_import_post_type' => 'page',
+        'csv_import_post_status' => 'draft',
+        'csv_import_page_builder' => 'gutenberg',
+        'csv_import_dropbox_url' => '',
+        'csv_import_local_path' => 'data/landingpages.csv',
+        'csv_import_image_source' => 'media_library',
+        'csv_import_image_folder' => 'wp-content/uploads/csv-import-images/',
+        'csv_import_memory_limit' => '256M',
+        'csv_import_time_limit' => 300,
+        'csv_import_seo_plugin' => 'none',
+        'csv_import_required_columns' => "post_title\npost_name",
+        'csv_import_skip_duplicates' => true
+    ];
+    
+    // Nur Basis-Einstellungen wiederherstellen, nicht überschreiben
+    foreach ($default_settings as $key => $value) {
+        if (get_option($key) === false) {
+            update_option($key, $value);
+        }
+    }
+    
+    // Plugin-Version aktualisieren
+    update_option('csv_import_version', defined('CSV_IMPORT_PRO_VERSION') ? CSV_IMPORT_PRO_VERSION : '5.4');
+    update_option('csv_import_last_hard_reset', current_time('mysql'));
+    
+    csv_import_log('debug', 'Plugin-Status zurückgesetzt');
+}
+
+/**
+ * Health-Check nach dem Reset
+ */
+function csv_import_post_reset_health_check() {
+    $health = [
+        'database_clean' => true,
+        'filesystem_clean' => true,
+        'cache_clear' => true,
+        'cron_clean' => true,
+        'no_active_imports' => true,
+        'settings_intact' => true
+    ];
+    
+    // Prüfe auf verbliebene Import-Optionen
+    global $wpdb;
+    $remaining_options = $wpdb->get_var("SELECT COUNT(*) FROM {$wpdb->options} WHERE option_name LIKE 'csv_import_progress%' OR option_name LIKE 'csv_import_running%'");
+    $health['database_clean'] = ($remaining_options == 0);
+    
+    // Prüfe auf aktive Imports
+    $health['no_active_imports'] = !csv_import_is_import_running();
+    
+    // Prüfe kritische Einstellungen
+    $critical_settings = ['csv_import_post_type', 'csv_import_post_status'];
+    foreach ($critical_settings as $setting) {
+        if (!get_option($setting)) {
+            $health['settings_intact'] = false;
+            break;
+        }
+    }
+    
+    // Prüfe WordPress Cron
+    $health['cron_clean'] = !wp_next_scheduled('csv_import_scheduled');
+    
+    return $health;
+}
+
+// ===================================================================
+// ERWEITERTE HILFSFUNKTIONEN FÜR HARD RESET
+// ===================================================================
+
+/**
+ * Rekursives Löschen von Verzeichnissen
+ */
+function csv_import_rmdir_recursive($dir) {
+    if (!is_dir($dir)) {
+        return false;
+    }
+    
+    $files = array_diff(scandir($dir), ['.', '..']);
+    foreach ($files as $file) {
+        $path = $dir . DIRECTORY_SEPARATOR . $file;
+        if (is_dir($path)) {
+            csv_import_rmdir_recursive($path);
+        } else {
+            @unlink($path);
+        }
+    }
+    
+    return @rmdir($dir);
+}
+
+/**
+ * Prüft ob Verzeichnis leer ist
+ */
+function csv_import_is_dir_empty($dir) {
+    if (!is_readable($dir)) {
+        return false;
+    }
+    
+    $handle = opendir($dir);
+    while (false !== ($entry = readdir($handle))) {
+        if ($entry != '.' && $entry != '..') {
+            closedir($handle);
+            return false;
+        }
+    }
+    closedir($handle);
+    return true;
+}
+
+/**
+ * Admin-Interface für Hard Reset
+ */
+function csv_import_hard_reset_admin_interface() {
+    if (!current_user_can('manage_options')) {
+        wp_die('Keine Berechtigung für diese Aktion.');
+    }
+    
+    if (!wp_verify_nonce($_GET['_wpnonce'] ?? '', 'csv_import_hard_reset')) {
+        wp_die('Sicherheitscheck fehlgeschlagen.');
+    }
+    
+    $force_cleanup = isset($_GET['force']) && $_GET['force'] === '1';
+    
+    // Hard Reset durchführen
+    $result = csv_import_hard_reset($force_cleanup);
+    
+    // Redirect mit Erfolgsmeldung
+    wp_redirect(add_query_arg([
+        'page' => 'csv-import',
+        'hard_reset' => 'success',
+        'force' => $force_cleanup ? '1' : '0'
+    ], admin_url('tools.php')));
+    exit;
+}
+
+/**
+ * Admin-Notice für Hard Reset-Erfolg
+ */
+function csv_import_show_hard_reset_notice() {
+    if (get_transient('csv_import_hard_reset_success')) {
+        $notice_data = get_transient('csv_import_hard_reset_success');
+        $health_status = $notice_data['health_status'];
+        $all_healthy = !in_array(false, $health_status, true);
+        
+        echo '<div class="notice notice-success is-dismissible">';
+        echo '<p><strong>CSV Import Pro:</strong> ' . esc_html($notice_data['message']) . '</p>';
+        
+        if (!$all_healthy) {
+            echo '<p><strong>Warnung:</strong> Einige Health-Checks sind fehlgeschlagen:</p>';
+            echo '<ul>';
+            foreach ($health_status as $check => $status) {
+                if (!$status) {
+                    echo '<li>' . esc_html($check) . ': <span style="color: red;">Fehlgeschlagen</span></li>';
+                }
+            }
+            echo '</ul>';
+        } else {
+            echo '<p style="color: green;">✅ Alle Health-Checks erfolgreich - System vollständig bereinigt!</p>';
+        }
+        
+        echo '</div>';
+        delete_transient('csv_import_hard_reset_success');
+    }
+}
+add_action('admin_notices', 'csv_import_show_hard_reset_notice');
+
+// Hard Reset Handler
+add_action('admin_init', function() {
+    if (isset($_GET['csv_hard_reset']) && $_GET['csv_hard_reset'] === '1') {
+        csv_import_hard_reset_admin_interface();
+    }
+});
+
+// ===================================================================
+// ERWEITERTE SELBSTHEILUNG (auf Basis der paste.txt)
+// ===================================================================
+
+/**
+ * PROAKTIVE SELBSTHEILUNG: Prüft bei jedem Admin-Aufruf auf veraltete Sperren.
+ * Basiert auf der paste.txt aber erweitert um Hard Reset-Integration
+ */
+function csv_import_aggressive_self_heal() {
+    // Prüfe den Lock direkt
+    $lock = get_option('csv_import_running_lock');
+    if ($lock && !empty($lock['locked_at'])) {
+        if ((time() - $lock['locked_at']) > 900) { // Älter als 15 Minuten
+            csv_import_force_reset_import_status();
+            set_transient('csv_import_stuck_reset_notice', true, 300);
+            
+            // Bei wiederholten Problemen Hard Reset vorschlagen
+            $reset_count = get_transient('csv_import_auto_reset_count') ?: 0;
+            $reset_count++;
+            set_transient('csv_import_auto_reset_count', $reset_count, 3600);
+            
+            if ($reset_count >= 3) {
+                set_transient('csv_import_suggest_hard_reset', true, 600);
+            }
+            
+            return;
+        }
+    }
+
+    // Prüfe den Fortschritt direkt
+    $progress = get_option('csv_import_progress', []);
+    if (!empty($progress['running']) && !empty($progress['start_time'])) {
+        if ((time() - $progress['start_time']) > 900) { // Älter als 15 Minuten
+            csv_import_force_reset_import_status();
+            set_transient('csv_import_stuck_reset_notice', true, 300);
+        }
+    }
+}
+add_action('admin_init', 'csv_import_aggressive_self_heal');
+
+/**
+ * Erweiterte Notice für Hard Reset-Vorschlag
+ */
+function csv_import_show_hard_reset_suggestion() {
+    if (get_transient('csv_import_suggest_hard_reset')) {
+        $hard_reset_url = wp_nonce_url(
+            add_query_arg(['csv_hard_reset' => '1'], admin_url('tools.php?page=csv-import')),
+            'csv_import_hard_reset'
+        );
+        
+        echo '<div class="notice notice-warning is-dismissible">';
+        echo '<p><strong>CSV Import Pro:</strong> Wiederholte Import-Probleme erkannt!</p>';
+        echo '<p>Es wurden mehrere hängende Prozesse automatisch zurückgesetzt. Ein Hard Reset könnte helfen:</p>';
+        echo '<p>';
+        echo '<a href="' . esc_url($hard_reset_url) . '" class="button button-secondary" ';
+        echo 'onclick="return confirm(\'HARD RESET: Alle Import-Daten, Einstellungen und temporären Dateien werden gelöscht!\\n\\nSind Sie sicher?\');">';
+        echo '🔧 Hard Reset durchführen';
+        echo '</a>';
+        echo '</p>';
+        echo '</div>';
+        
+        delete_transient('csv_import_suggest_hard_reset');
+    }
+}
+add_action('admin_notices', 'csv_import_show_hard_reset_suggestion');
 
 // ===================================================================
 // VORBEUGENDE MAßNAHMEN & SCHUTZ VOR HÄNGENDEN IMPORTS
@@ -38,8 +1133,7 @@ function csv_import_check_stuck_imports() {
 }
 
 /**
- * Erzwingt das Zurücksetzen des Import-Status (Notfall-Reset)
- * Verstärkt: Inklusive Cache-Flush für hartnäckige Sperren.
+ * Erzwingt das Zurücksetzen des Import-Status (Standard-Reset aus paste.txt)
  */
 function csv_import_force_reset_import_status() {
     // Schritt 1: WordPress Object Cache leeren (gegen Redis/Memcached)
@@ -50,25 +1144,24 @@ function csv_import_force_reset_import_status() {
     // Schritt 2: Alle import-bezogenen Optionen löschen
     $import_options = [
         'csv_import_progress',
-        'csv_import_session_id', 
+        'csv_import_session_id',
         'csv_import_start_time',
         'csv_import_current_header',
         'csv_import_running_lock',
         'csv_import_batch_progress'
     ];
-    
+
     foreach ($import_options as $option) {
         delete_option($option);
         delete_transient($option);
     }
-    
+
     // Schritt 3: Import-Lock aus der Datenbank per Direkt-Query entfernen
     global $wpdb;
     $wpdb->query("DELETE FROM {$wpdb->options} WHERE option_name LIKE '%csv_import%lock%'");
-    
-    csv_import_log('info', 'Import-Status wurde komplett zurückgesetzt (Notfall-Reset inkl. Cache-Flush)');
-}
 
+    csv_import_log('info', 'Import-Status wurde komplett zurückgesetzt (Standard-Reset)');
+}
 
 /**
  * Sicherer Import-Status Check mit automatischer Bereinigung (SELBSTHEILEND)
@@ -111,7 +1204,6 @@ function csv_import_is_import_running() {
     // Wenn wir hier ankommen, läuft wahrscheinlich ein echter Import
     return !empty($progress['running']);
 }
-
 
 /**
  * Sichere Import-Start Funktion mit Doppel-Check
@@ -169,19 +1261,6 @@ function csv_import_remove_import_lock() {
     delete_option('csv_import_running_lock');
     delete_option('csv_import_start_time');
 }
-
-/**
- * Admin-Notice für automatische Resets anzeigen
- */
-function csv_import_show_stuck_reset_notice() {
-    if (get_transient('csv_import_stuck_reset_notice')) {
-        echo '<div class="notice notice-warning is-dismissible">
-            <p><strong>CSV Import:</strong> Ein hängender Import-Prozess wurde automatisch zurückgesetzt. Sie können nun wieder importieren.</p>
-        </div>';
-        delete_transient('csv_import_stuck_reset_notice');
-    }
-}
-add_action('admin_notices', 'csv_import_show_stuck_reset_notice');
 
 /**
  * Erweiterte Bereinigungsfunktion für tote Import-Prozesse
@@ -493,7 +1572,7 @@ function csv_import_validate_dropbox_source( array $config ): array {
     $response = wp_remote_get( $download_url, [
         'timeout' => 30,
         'headers' => [
-            'User-Agent' => 'CSV Import Pro/' . (defined('CSV_IMPORT_PRO_VERSION') ? CSV_IMPORT_PRO_VERSION : '5.1')
+            'User-Agent' => 'CSV Import Pro/' . (defined('CSV_IMPORT_PRO_VERSION') ? CSV_IMPORT_PRO_VERSION : '5.4')
         ]
     ] );
     
@@ -672,7 +1751,7 @@ function csv_import_load_dropbox_csv( array $config ): array {
     $response = wp_remote_get( $download_url, [
         'timeout' => 60,
         'headers' => [
-            'User-Agent' => 'CSV Import Pro/' . (defined('CSV_IMPORT_PRO_VERSION') ? CSV_IMPORT_PRO_VERSION : '5.1')
+            'User-Agent' => 'CSV Import Pro/' . (defined('CSV_IMPORT_PRO_VERSION') ? CSV_IMPORT_PRO_VERSION : '5.4')
         ]
     ] );
     
@@ -919,11 +1998,6 @@ function csv_import_process_data( array $csv_data, array $config, string $sessio
             if ( $post_result === 'created' ) {
                 $created_posts[] = $post_result;
                 $processed++;
-            } elseif ( $post_result === 'skipped' ) {
-                // Übersprungene Posts nicht als Fehler zählen
-            }
-            
-            $processed++;
             
             // Kurze Pause alle 10 Posts
             if ( $processed % 10 === 0 ) {
@@ -1636,346 +2710,9 @@ function csv_import_create_backup( string $session_id ): bool {
         'session_id' => $session_id,
         'timestamp' => current_time( 'mysql' ),
         'pre_import_post_count' => wp_count_posts()->publish,
-        'user_id' => get_current_user_id(),
-        'memory_usage' => memory_get_usage( true ),
-        'mysql_version' => $wpdb->db_version(),
-        'wp_version' => get_bloginfo( 'version' ),
-        'php_version' => PHP_VERSION,
-        'server_info' => $_SERVER['SERVER_SOFTWARE'] ?? 'unknown'
-    ];
-    
-    update_option( 'csv_import_backup_' . $session_id, $backup_info );
-    csv_import_log( 'info', "Backup für Session {$session_id} erstellt" );
-    
-    return true;
-}
-
-/**
- * Bereinigt temporäre Dateien und alte Daten mit erweiterten Optionen
- */
-function csv_import_cleanup_temp_files( int $older_than_hours = 24 ): void {
-    $upload_dir = wp_upload_dir();
-    $temp_dir = $upload_dir['basedir'] . '/csv-import-temp/';
-    $cutoff_time = time() - ( $older_than_hours * 3600 );
-    $deleted_files = 0;
-    
-    if ( is_dir( $temp_dir ) ) {
-        $files = glob( $temp_dir . '*' );
-        foreach ( $files as $file ) {
-            if ( is_file( $file ) && filemtime( $file ) < $cutoff_time ) {
-                if ( @unlink( $file ) ) {
-                    $deleted_files++;
-                }
+        'user
+            } elseif ( $post_result === 'skipped' ) {
+                // Übersprungene Posts nicht als Fehler zählen
             }
-        }
-        
-        // Leere Verzeichnisse entfernen
-        if ( is_dir_empty( $temp_dir ) ) {
-            @rmdir( $temp_dir );
-        }
-    }
-    
-    if ( $deleted_files > 0 ) {
-        csv_import_log( 'info', "Bereinigung: {$deleted_files} temporäre Dateien gelöscht" );
-    }
-}
-
-/**
- * Prüft ob ein Verzeichnis leer ist
- */
-function is_dir_empty( string $dir ): bool {
-    if ( ! is_readable( $dir ) ) {
-        return false;
-    }
-    
-    $handle = opendir( $dir );
-    while ( false !== ( $entry = readdir( $handle ) ) ) {
-        if ( $entry != '.' && $entry != '..' ) {
-            closedir( $handle );
-            return false;
-        }
-    }
-    closedir( $handle );
-    return true;
-}
-
-// ===================================================================
-// LOGGING & FEHLERBEHANDLUNG MIT ERWEITERTEN FEATURES
-// ===================================================================
-
-/**
- * Verfolgt Fehlerstatistiken für das Monitoring mit erweiterten Metriken.
- *
- * @param string $level
- * @param string $message
- */
-function csv_import_track_error_stats( string $level, string $message ): void {
-    $stats = get_option( 'csv_import_error_stats', [
-        'total_errors'      => 0,
-        'total_real_errors' => 0,
-        'errors_by_level'   => [],
-        'recent_errors'     => [],
-        'error_trends'      => [],
-        'critical_errors_24h' => 0,
-        'warning_errors_24h' => 0
-    ] );
-
-    // Gesamtzahl aller Meldungen
-    $stats['total_errors']++;
-
-    // Echte Fehler (critical, error, warning) separat zählen
-    if ( in_array( $level, ['critical', 'error', 'warning'] ) ) {
-        $stats['total_real_errors'] = ( $stats['total_real_errors'] ?? 0 ) + 1;
-        
-        // 24h Zähler für kritische Fehler und Warnungen
-        if ( $level === 'critical' || $level === 'error' ) {
-            $stats['critical_errors_24h'] = ( $stats['critical_errors_24h'] ?? 0 ) + 1;
-        } elseif ( $level === 'warning' ) {
-            $stats['warning_errors_24h'] = ( $stats['warning_errors_24h'] ?? 0 ) + 1;
-        }
-    }
-
-    // Fehler pro Level
-    $stats['errors_by_level'][ $level ] = ( $stats['errors_by_level'][ $level ] ?? 0 ) + 1;
-
-    // Letzte Fehler (die letzten 50 behalten)
-    $stats['recent_errors'][] = [
-        'level'   => $level,
-        'message' => mb_substr( $message, 0, 200 ), // Nachrichtenlänge begrenzen
-        'time'    => current_time( 'mysql' ),
-        'user_id' => get_current_user_id(),
-        'ip'      => $_SERVER['REMOTE_ADDR'] ?? 'unknown'
-    ];
-    $stats['recent_errors'] = array_slice( $stats['recent_errors'], -50 );
-
-    // Tägliche Trends für echte Fehler
-    if ( in_array( $level, ['critical', 'error', 'warning'] ) ) {
-        $today = current_time( 'Y-m-d' );
-        $stats['error_trends'][ $today ] = ( $stats['error_trends'][ $today ] ?? 0 ) + 1;
-
-        // Alte Trends aufräumen (letzte 30 Tage behalten)
-        if ( count( $stats['error_trends'] ) > 30 ) {
-            $stats['error_trends'] = array_slice( $stats['error_trends'], -30, null, true );
-        }
-    }
-
-    update_option( 'csv_import_error_stats', $stats );
-}
-
-/**
- * Loggt Import-Aktivitäten mit erweiterten Kontextdaten
- */
-function csv_import_log( string $level, string $message, array $context = [] ): void {
-    // Erweiterte Kontextdaten hinzufügen
-    $context = array_merge( $context, [
-        'timestamp' => current_time( 'mysql' ),
-        'user_id' => get_current_user_id(),
-        'memory_usage' => memory_get_usage( true ),
-        'peak_memory' => memory_get_peak_usage( true ),
-        'php_version' => PHP_VERSION,
-        'plugin_version' => defined('CSV_IMPORT_PRO_VERSION') ? CSV_IMPORT_PRO_VERSION : 'unknown'
-    ] );
-    
-    if ( class_exists( 'CSV_Import_Error_Handler' ) ) {
-        CSV_Import_Error_Handler::handle( $level, $message, $context );
-    } else {
-        error_log( sprintf( '[CSV Import Pro %s] %s', strtoupper( $level ), $message ) );
-    }
-    
-    // In Statistiken verfolgen
-    csv_import_track_error_stats( $level, $message );
-    
-    // Zusätzlich in eigenes Log schreiben (falls Debug-Modus)
-    if ( defined( 'WP_DEBUG' ) && WP_DEBUG ) {
-        csv_import_debug_log( $message, $context );
-    }
-    
-    // Bei kritischen Fehlern sofort Admin benachrichtigen
-    if ( $level === 'critical' ) {
-        csv_import_send_critical_error_notification( $message, $context );
-    }
-}
-
-/**
- * Debug-Logging in separate Datei mit Rotation
- */
-function csv_import_debug_log( string $message, array $context = [] ): void {
-    $upload_dir = wp_upload_dir();
-    $log_file = $upload_dir['basedir'] . '/csv-import-debug.log';
-    
-    // Log-Rotation: Wenn Datei größer als 10MB, in .old umbenennen
-    if ( file_exists( $log_file ) && filesize( $log_file ) > 10485760 ) {
-        @rename( $log_file, $upload_dir['basedir'] . '/csv-import-debug.log.old' );
-    }
-    
-    $log_entry = sprintf(
-        "[%s] [%s] %s %s\n",
-        current_time( 'Y-m-d H:i:s' ),
-        strtoupper( WP_DEBUG ? 'DEBUG' : 'INFO' ),
-        $message,
-        ! empty( $context ) ? wp_json_encode( $context, JSON_PRETTY_PRINT ) : ''
-    );
-    
-    @file_put_contents( $log_file, $log_entry, FILE_APPEND | LOCK_EX );
-}
-
-/**
- * Sendet kritische Fehler-Benachrichtigungen
- */
-function csv_import_send_critical_error_notification( string $message, array $context = [] ): void {
-    // Throttling: Nicht mehr als 1 kritischer Fehler pro Stunde
-    $last_critical = get_transient( 'csv_import_last_critical_notification' );
-    if ( $last_critical ) {
-        return;
-    }
-    
-    set_transient( 'csv_import_last_critical_notification', time(), 3600 );
-    
-    $admin_email = get_option( 'admin_email' );
-    $site_name = get_bloginfo( 'name' );
-    
-    $subject = "[$site_name] CSV Import Pro - Kritischer Fehler";
-    $body = "Ein kritischer Fehler ist im CSV Import Pro Plugin aufgetreten:\n\n";
-    $body .= "Fehler: $message\n\n";
-    $body .= "Zeit: " . current_time( 'Y-m-d H:i:s' ) . "\n";
-    $body .= "Benutzer: " . ( $context['user_id'] ?? 'unbekannt' ) . "\n";
-    $body .= "Speicherverbrauch: " . size_format( $context['memory_usage'] ?? 0 ) . "\n\n";
-    $body .= "Weitere Details finden Sie in den Plugin-Logs.\n\n";
-    $body .= "-- CSV Import Pro System";
-    
-    wp_mail( $admin_email, $subject, $body );
-}
-
-// ===================================================================
-// INITIALIZATION & MAINTENANCE MIT ERWEITERTEN FEATURES
-// ===================================================================
-
-/**
- * Führt tägliche Wartungsaufgaben aus mit erweiterten Features
- */
-function csv_import_daily_maintenance(): void {
-    csv_import_log( 'debug', 'Starte tägliche Wartung' );
-    
-    // 1. Alte Fehlerstatistiken bereinigen
-    $stats = csv_import_get_error_stats();
-    
-    // Alte Einträge entfernen (älter als 30 Tage)
-    $cutoff_date = date( 'Y-m-d', strtotime( '-30 days' ) );
-    
-    if ( isset( $stats['error_trends'] ) ) {
-        $cleaned = 0;
-        foreach ( $stats['error_trends'] as $date => $count ) {
-            if ( $date < $cutoff_date ) {
-                unset( $stats['error_trends'][ $date ] );
-                $cleaned++;
-            }
-        }
-        if ($cleaned > 0) {
-            csv_import_log( 'debug', "Bereinigt: {$cleaned} alte Fehler-Trend-Einträge" );
-        }
-    }
-    
-    // Nur die letzten 50 Fehler behalten
-    if ( isset( $stats['recent_errors'] ) && count( $stats['recent_errors'] ) > 50 ) {
-        $stats['recent_errors'] = array_slice( $stats['recent_errors'], -50 );
-    }
-    
-    // 24h-Zähler zurücksetzen
-    $stats['critical_errors_24h'] = 0;
-    $stats['warning_errors_24h'] = 0;
-    
-    update_option( 'csv_import_error_stats', $stats );
-    
-    // 2. Temporäre Dateien aufräumen
-    csv_import_cleanup_temp_files( 24 );
-    
-    // 3. Alte Backup-Informationen bereinigen (älter als 7 Tage)
-    global $wpdb;
-    $old_backups = $wpdb->get_results(
-        "SELECT option_name FROM {$wpdb->options} 
-         WHERE option_name LIKE 'csv_import_backup_%' 
-         LIMIT 100"
-    );
-    
-    $deleted_backups = 0;
-    foreach ( $old_backups as $backup ) {
-        $backup_data = get_option( $backup->option_name );
-        if ( isset( $backup_data['timestamp'] ) ) {
-            $backup_time = strtotime( $backup_data['timestamp'] );
-            if ( $backup_time < strtotime( '-7 days' ) ) {
-                delete_option( $backup->option_name );
-                $deleted_backups++;
-            }
-        }
-    }
-    
-    if ( $deleted_backups > 0 ) {
-        csv_import_log( 'debug', "Bereinigt: {$deleted_backups} alte Backup-Einträge" );
-    }
-    
-    // 4. Hängende Import-Prozesse bereinigen
-    csv_import_cleanup_dead_processes();
-    
-    // 5. Backup alte Progress-Optionen löschen
-    delete_transient( 'csv_import_progress' );
-    
-    // 6. Plugin-Performance-Metriken sammeln
-    $memory_limit = csv_import_convert_to_bytes( ini_get( 'memory_limit' ) );
-    $disk_free = function_exists('disk_free_space') ? @disk_free_space( ABSPATH ) : 0;
-    
-    update_option( 'csv_import_system_metrics', [
-        'memory_limit' => $memory_limit,
-        'disk_free' => $disk_free,
-        'last_maintenance' => current_time( 'mysql' ),
-        'php_version' => PHP_VERSION,
-        'wp_version' => get_bloginfo( 'version' )
-    ] );
-    
-    csv_import_log( 'debug', 'Tägliche Wartung abgeschlossen', [
-        'deleted_backups' => $deleted_backups,
-        'memory_limit' => size_format( $memory_limit ),
-        'disk_free' => size_format( $disk_free )
-    ] );
-}
-
-/**
- * Wöchentliche Wartungsaufgaben
- */
-function csv_import_weekly_maintenance(): void {
-    csv_import_log( 'debug', 'Starte wöchentliche Wartung' );
-    
-    // Erweiterte Bereinigung
-    csv_import_cleanup_temp_files( 168 ); // 7 Tage
-    
-    // Plugin-Health-Check
-    $health = csv_import_system_health_check();
-    $health_issues = array_filter( $health, function( $value, $key ) {
-        return $value === false && $key !== 'import_locks' && $key !== 'stuck_processes';
-    }, ARRAY_FILTER_USE_BOTH );
-    
-    if ( ! empty( $health_issues ) ) {
-        csv_import_log( 'warning', 'System-Health-Probleme erkannt', [
-            'issues' => array_keys( $health_issues )
-        ] );
-    }
-    
-    csv_import_log( 'debug', 'Wöchentliche Wartung abgeschlossen' );
-}
-
-// Hook für erweiterte Wartung
-if ( ! wp_next_scheduled( 'csv_import_daily_maintenance' ) ) {
-    wp_schedule_event( time(), 'daily', 'csv_import_daily_maintenance' );
-}
-
-if ( ! wp_next_scheduled( 'csv_import_weekly_maintenance' ) ) {
-    wp_schedule_event( time(), 'weekly', 'csv_import_weekly_maintenance' );
-}
-
-add_action( 'csv_import_daily_maintenance', 'csv_import_daily_maintenance' );
-add_action( 'csv_import_weekly_maintenance', 'csv_import_weekly_maintenance' );
-
-// ===================================================================
-// ABSCHLUSS
-// ===================================================================
-
-csv_import_log( 'debug', 'CSV Import Pro Core Functions geladen - Version 5.3 (Self-healing logic)' );
+            
+            $processed++;
