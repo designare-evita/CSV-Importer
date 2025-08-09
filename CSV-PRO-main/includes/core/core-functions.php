@@ -3,7 +3,7 @@
  * Core-Funktionen für das CSV Import Pro Plugin
  * Diese Datei enthält alle grundlegenden Funktionen, die von anderen Plugin-Teilen
  * benötigt werden. Sie muss als erstes geladen werden.
- * Version: 5.2-refactored (Dashboard Widget bereinigt)
+ * Version: 5.3 (Self-healing logic)
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -39,7 +39,7 @@ function csv_import_check_stuck_imports() {
 
 /**
  * Erzwingt das Zurücksetzen des Import-Status (Notfall-Reset)
- * NEU: Inklusive Cache-Flush für hartnäckige Sperren.
+ * Verstärkt: Inklusive Cache-Flush für hartnäckige Sperren.
  */
 function csv_import_force_reset_import_status() {
     // Schritt 1: WordPress Object Cache leeren (gegen Redis/Memcached)
@@ -71,9 +71,20 @@ function csv_import_force_reset_import_status() {
 
 
 /**
- * Sicherer Import-Status Check mit automatischer Bereinigung
+ * Sicherer Import-Status Check mit automatischer Bereinigung (SELBSTHEILEND)
  */
 function csv_import_is_import_running() {
+    // Prüfung auf veralteten Lock (älter als 15 Minuten ist definitiv ein Fehler)
+    $lock = get_option('csv_import_running_lock');
+    if ($lock && !empty($lock['locked_at'])) {
+        $lock_age = time() - $lock['locked_at'];
+        if ($lock_age > 900) { // 15 Minuten
+            csv_import_force_reset_import_status();
+            csv_import_log('warning', 'Veralteter Import-Lock (>15 min) gefunden & automatisch bereinigt.');
+            return false;
+        }
+    }
+
     $progress = get_option('csv_import_progress', []);
     
     // Wenn kein Progress-Eintrag vorhanden ist, läuft definitiv kein Import
@@ -86,19 +97,21 @@ function csv_import_is_import_running() {
         return false;
     }
     
-    // Timestamp-basierte Validierung
+    // Timestamp-basierte Validierung (älter als 15 Minuten ist definitiv ein Fehler)
     if (!empty($progress['start_time'])) {
         $runtime = time() - $progress['start_time'];
         
-        // Imports länger als 15 Minuten sind definitiv hängend
-        if ($runtime > 900) {
+        if ($runtime > 900) { // 15 Minuten
             csv_import_force_reset_import_status();
+            csv_import_log('warning', 'Hängengebliebener Import (>15 min) gefunden & automatisch bereinigt.');
             return false;
         }
     }
     
-    return true;
+    // Wenn wir hier ankommen, läuft wahrscheinlich ein echter Import
+    return !empty($progress['running']);
 }
+
 
 /**
  * Sichere Import-Start Funktion mit Doppel-Check
@@ -141,7 +154,7 @@ function csv_import_set_import_lock() {
     $lock_data = [
         'locked_at' => time(),
         'locked_by' => get_current_user_id(),
-        'process_id' => getmypid(),
+        'process_id' => function_exists('getmypid') ? getmypid() : null,
         'server_ip' => $_SERVER['SERVER_ADDR'] ?? 'unknown'
     ];
     
@@ -1715,7 +1728,6 @@ function csv_import_track_error_stats( string $level, string $message ): void {
         $stats['total_real_errors'] = ( $stats['total_real_errors'] ?? 0 ) + 1;
         
         // 24h Zähler für kritische Fehler und Warnungen
-        $cutoff_24h = time() - 86400;
         if ( $level === 'critical' || $level === 'error' ) {
             $stats['critical_errors_24h'] = ( $stats['critical_errors_24h'] ?? 0 ) + 1;
         } elseif ( $level === 'warning' ) {
@@ -1858,7 +1870,9 @@ function csv_import_daily_maintenance(): void {
                 $cleaned++;
             }
         }
-        csv_import_log( 'debug', "Bereinigt: {$cleaned} alte Fehler-Trend-Einträge" );
+        if ($cleaned > 0) {
+            csv_import_log( 'debug', "Bereinigt: {$cleaned} alte Fehler-Trend-Einträge" );
+        }
     }
     
     // Nur die letzten 50 Fehler behalten
@@ -1880,7 +1894,6 @@ function csv_import_daily_maintenance(): void {
     $old_backups = $wpdb->get_results(
         "SELECT option_name FROM {$wpdb->options} 
          WHERE option_name LIKE 'csv_import_backup_%' 
-         AND option_value LIKE '%\"timestamp\":\"%' 
          LIMIT 100"
     );
     
@@ -1908,7 +1921,7 @@ function csv_import_daily_maintenance(): void {
     
     // 6. Plugin-Performance-Metriken sammeln
     $memory_limit = csv_import_convert_to_bytes( ini_get( 'memory_limit' ) );
-    $disk_free = disk_free_space( ABSPATH );
+    $disk_free = function_exists('disk_free_space') ? @disk_free_space( ABSPATH ) : 0;
     
     update_option( 'csv_import_system_metrics', [
         'memory_limit' => $memory_limit,
@@ -1965,4 +1978,4 @@ add_action( 'csv_import_weekly_maintenance', 'csv_import_weekly_maintenance' );
 // ABSCHLUSS
 // ===================================================================
 
-csv_import_log( 'debug', 'CSV Import Pro Core Functions geladen - Version 5.2 (Dashboard Widget bereinigt)' );
+csv_import_log( 'debug', 'CSV Import Pro Core Functions geladen - Version 5.3 (Self-healing logic)' );
